@@ -1,49 +1,61 @@
 #!/usr/bin/env bash
 #
 # ──────────────────────────────────────────────────────────────────────────────
-#  post-merge hook  –  targeted package downloads after git pull/merge (AWS S3)
+#  post-rewrite hook  –  targeted package downloads after rebase/amend (AWS S3)
 #
-#  • Fires automatically after:
-#       - `git pull` (even fast-forward)         - `git merge`
-#       - `git checkout <branch>`                - rebases that move HEAD
+#  This hook fires after git operations that rewrite commits:
+#       - `git rebase`
+#       - `git commit --amend`
+#       - `git filter-branch`
 #
-#  • Default behavior (no flags):
+#  When commits are rewritten, package references in pkgsinfo may change.
+#  This hook ensures your local pkgs directory stays in sync with S3.
+#
+#  Default behavior (no flags):
 #       - Parses changed pkgsinfo files (YAML/plist)
 #       - Extracts installer_item_location from each
-#       - Downloads ONLY those specific packages using aws s3 cp
+#       - Downloads ONLY those specific packages from S3
 #       - Syncs catalogs/icons folders if changed
 #
-#  • Flags:
-#       --sync    : Full folder sync (incremental with size/timestamp comparison)
+#  Flags:
+#       --sync    : Full folder sync (incremental)
 #       --force   : Full download with confirmation (forces re-download of all)
 #       --dry-run : Show what would be downloaded without actually downloading
+#       --path    : Download a specific package path
 #
-#  • Daily rotating log kept in .git/logs (7-day retention).
+#  Configuration (set these environment variables or edit defaults below):
+#       MUNKI_REPO_PATH  - Path to your Munki repo (default: ~/munki-repo)
+#       MUNKI_S3_BUCKET  - S3 bucket name (e.g., your-munki-bucket)
+#       MUNKI_S3_PREFIX  - Optional prefix/folder in bucket (default: empty)
+#       AWS_REGION       - AWS region (default: us-east-1)
+#       AWS_PROFILE      - Optional AWS CLI profile to use
+#
+#  Daily rotating log kept in .git/logs (7-day retention).
 # ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 set -f
 shopt -s nullglob
 
-# ── Configuration (customize these for your environment) ───
-# Set your Munki repo root path
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
-if [[ -z "$REPO_ROOT" ]]; then
-  REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-fi
-
-# AWS S3 configuration - customize these values or set via environment
+# ── Configuration ──────────────────────────────────────────
+BASE="${MUNKI_REPO_PATH:-$HOME/munki-repo}"
 S3_BUCKET="${MUNKI_S3_BUCKET:-your-munki-bucket}"
-S3_PREFIX="${MUNKI_S3_PREFIX:-}"  # Optional prefix within bucket
+S3_PREFIX="${MUNKI_S3_PREFIX:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-S3_URL="s3://${S3_BUCKET}${S3_PREFIX:+/$S3_PREFIX}"
+
+# Build S3 URL (with optional prefix)
+if [[ -n "$S3_PREFIX" ]]; then
+  S3_URL="s3://${S3_BUCKET}/${S3_PREFIX}"
+else
+  S3_URL="s3://${S3_BUCKET}"
+fi
 
 # ── check for AWS CLI ──────────────────────────────────────
 if ! command -v aws &>/dev/null; then
   echo "" >&2
   echo "ERROR: AWS CLI not found" >&2
   echo "" >&2
-  echo "The post-merge hook needs AWS CLI to download packages from S3." >&2
+  echo "The post-rewrite hook needs the AWS CLI to download packages from S3." >&2
   echo "" >&2
   echo "To install AWS CLI:" >&2
   echo "  brew install awscli" >&2
@@ -85,12 +97,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── logging ────────────────────────────────────────────────
-LOGDIR="$REPO_ROOT/.git/logs"
+LOGDIR="$BASE/.git/logs"
 mkdir -p "$LOGDIR"
 TODAY=$(date +%F)
-LOGFILE="$LOGDIR/hook-post-merge-download-$TODAY.log"
+LOGFILE="$LOGDIR/hook-post-rewrite-download-$TODAY.log"
 : >"$LOGFILE"
-find "$LOGDIR" -name 'hook-post-merge-download-*.log' -mtime +7 -exec rm {} \;
+find "$LOGDIR" -name 'hook-post-rewrite-download-*.log' -mtime +7 -exec rm {} \;
 
 log() {
   local ts=$(date '+%Y-%m-%d %H:%M:%S')
@@ -99,7 +111,7 @@ log() {
 
 next_index() {
   local max=0
-  for f in "$LOGDIR"/hook-post-merge-download-"$TODAY"-*; do
+  for f in "$LOGDIR"/hook-post-rewrite-download-"$TODAY"-*; do
     [[ -e $f ]] || continue
     local n=${f##*-}; n=${n%.log}
     (( n > max )) && max=$n
@@ -109,15 +121,26 @@ next_index() {
 
 # ── AWS authentication check ───────────────────────────────
 check_aws_auth() {
-  if ! aws sts get-caller-identity &>/dev/null; then
+  AWS_CMD=(aws)
+  [[ -n "${AWS_PROFILE:-}" ]] && AWS_CMD+=(--profile "$AWS_PROFILE")
+  AWS_CMD+=(--region "$AWS_REGION")
+  
+  if ! "${AWS_CMD[@]}" sts get-caller-identity &>/dev/null; then
     log "AWS CLI not authenticated. Please configure credentials first."
-    log "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+    log "Run: aws configure"
     exit 1
   fi
 }
 
+# Build AWS command with profile/region
+aws_cmd() {
+  local cmd=(aws)
+  [[ -n "${AWS_PROFILE:-}" ]] && cmd+=(--profile "$AWS_PROFILE")
+  cmd+=(--region "$AWS_REGION")
+  "${cmd[@]}" "$@"
+}
+
 # ── parse pkgsinfo files for installer locations ───────────
-# Extract installer_item_location from a single pkgsinfo file
 extract_location_from_pkgsinfo() {
   local pkgsinfo_file="$1"
   local location=""
@@ -125,23 +148,21 @@ extract_location_from_pkgsinfo() {
   if [[ "$pkgsinfo_file" =~ \.(yaml|yml)$ ]]; then
     location=$(grep -E '^\s*installer_item_location:\s*' "$pkgsinfo_file" 2>/dev/null | sed -E 's/^\s*installer_item_location:\s*//' | tr -d '"' | xargs | head -1)
   else
-    # Assume plist (including extensionless files)
     location=$(plutil -extract installer_item_location raw "$pkgsinfo_file" 2>/dev/null | xargs || true)
   fi
   
   echo "$location"
 }
 
-# Extract installer locations from a list of changed pkgsinfo files
 extract_installer_locations() {
   local changed_pkgsinfo="$1"
   local installer_locations=()
   
   while IFS= read -r pkgsinfo_file; do
     [[ -z "$pkgsinfo_file" ]] && continue
-    [[ ! -f "$REPO_ROOT/$pkgsinfo_file" ]] && continue
+    [[ ! -f "$BASE/$pkgsinfo_file" ]] && continue
     
-    local location=$(extract_location_from_pkgsinfo "$REPO_ROOT/$pkgsinfo_file")
+    local location=$(extract_location_from_pkgsinfo "$BASE/$pkgsinfo_file")
     
     if [[ -n "$location" ]]; then
       installer_locations+=("$location")
@@ -154,7 +175,7 @@ extract_installer_locations() {
 
 # ── build canonical package list from ALL pkgsinfo files ───
 build_canonical_pkg_list() {
-  local pkgsinfo_dir="$REPO_ROOT/deployment/pkgsinfo"
+  local pkgsinfo_dir="$BASE/pkgsinfo"
   local canonical_list=()
   
   while IFS= read -r -d '' pkgsinfo_file; do
@@ -169,7 +190,7 @@ build_canonical_pkg_list() {
 
 # ── cleanup orphan packages not referenced by any pkgsinfo ─
 cleanup_orphan_packages() {
-  local pkgs_dir="$REPO_ROOT/deployment/pkgs"
+  local pkgs_dir="$BASE/pkgs"
   local canonical_file=$(mktemp)
   local orphan_count=0
   
@@ -190,7 +211,7 @@ cleanup_orphan_packages() {
         rm -f "$pkg_file"
         log "    Deleted"
       fi
-      ((orphan_count++)) || true
+      ((orphan_count++))
     fi
   done < <(find "$pkgs_dir" -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.zip" -o -name "*.mobileconfig" \) -print0 2>/dev/null)
   
@@ -222,10 +243,10 @@ detect_changes() {
     return
   fi
   
-  local changed_files=$(git diff --name-only HEAD~1 HEAD -- deployment/ 2>/dev/null || true)
+  local changed_files=$(git diff --name-only HEAD~1 HEAD -- pkgsinfo/ catalogs/ icons/ 2>/dev/null || true)
   
   if [[ -z "$changed_files" ]]; then
-    log "No changes detected in deployment/ directory. Skipping sync."
+    log "No changes detected in tracked directories. Skipping sync."
     echo "none"
     return
   fi
@@ -237,11 +258,11 @@ detect_changes() {
   while IFS= read -r file; do
     [[ -z "$file" ]] && continue
     
-    if [[ "$file" =~ ^deployment/catalogs/ ]]; then
+    if [[ "$file" =~ ^catalogs/ ]]; then
       needs_catalogs=true
-    elif [[ "$file" =~ ^deployment/icons/ ]]; then
+    elif [[ "$file" =~ ^icons/ ]]; then
       needs_icons=true
-    elif [[ "$file" =~ ^deployment/pkgsinfo/ ]]; then
+    elif [[ "$file" =~ ^pkgsinfo/ ]]; then
       changed_pkgsinfo+="$file"$'\n'
     fi
   done <<< "$changed_files"
@@ -257,7 +278,7 @@ detect_changes() {
     log "Changes detected but not in sync-relevant directories. Skipping sync."
     echo "none"
   else
-    echo "$changed_pkgsinfo" > "$REPO_ROOT/.git/logs/.changed-pkgsinfo-$$"
+    echo "$changed_pkgsinfo" > "$BASE/.git/logs/.changed-pkgsinfo-$$"
     echo "$result"
   fi
 }
@@ -269,21 +290,21 @@ if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
   check_aws_auth
   
   for target_path in "${TARGET_PATHS[@]}"; do
-    if [[ "$target_path" != deployment/* ]]; then
-      target_path="deployment/pkgs/$target_path"
+    if [[ "$target_path" != pkgs/* ]]; then
+      target_path="pkgs/$target_path"
     fi
     
-    local_path="$REPO_ROOT/$target_path"
-    remote_url="$S3_URL/$target_path"
+    local_path="$BASE/$target_path"
+    remote_path="$S3_URL/$target_path"
     
     mkdir -p "$(dirname "$local_path")"
     
     log "  -> syncing: $target_path"
     
     if [[ "$DRY_RUN" == "true" ]]; then
-      log "  [DRY RUN] Would download: $remote_url -> $local_path"
+      log "  [DRY RUN] Would download: $remote_path -> $local_path"
     else
-      aws s3 cp "$remote_url" "$local_path" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE" || {
+      aws_cmd s3 cp "$remote_path" "$local_path" 2>&1 | tee -a "$LOGFILE" || {
         log "  WARNING: Failed to download $target_path (may not exist in S3)"
       }
     fi
@@ -316,33 +337,33 @@ fi
 # ── AWS authentication ─────────────────────────────────────
 check_aws_auth
 
-# ── cleanup .DS_Store files ────────────────────────────────
-log "Cleaning up .DS_Store files"
-find "$REPO_ROOT/deployment" -name ".DS_Store" -type f -delete 2>/dev/null || true
-find "$REPO_ROOT/.git/logs" -name ".changed-pkgsinfo-*" -type f -mmin +60 -delete 2>/dev/null || true
+# ── cleanup .DS_Store and stale temp files ────────────────
+log "Cleaning up .DS_Store and stale temp files"
+find "$BASE" -name ".DS_Store" -type f -delete 2>/dev/null || true
+find "$BASE/.git/logs" -name ".changed-pkgsinfo-*" -type f -mmin +60 -delete 2>/dev/null || true
 
 # ── handle force mode ──────────────────────────────────────
 if [[ "$changed_paths" == "force" ]]; then
-  log "WARNING: FORCE MODE - This will download ALL data"
+  log "WARNING: FORCE MODE - This will download ALL packages"
   echo "This operation will download the entire repository from S3."
   echo ""
   read -p "Continue with full download? (y/N) " -n 1 -r
   echo ""
   [[ ! $REPLY =~ ^[Yy]$ ]] && { log "Aborted."; exit 0; }
   
-  log ">> force downloading deployment/catalogs"
-  aws s3 sync "$S3_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" \
-    --delete --exclude "*.DS_Store" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
+  log ">> force downloading catalogs"
+  aws_cmd s3 sync "$S3_URL/catalogs/" "$BASE/catalogs" \
+    --delete --exclude "*.DS_Store" 2>&1 | tee -a "$LOGFILE"
   
-  log ">> force downloading deployment/pkgs"
-  aws s3 sync "$S3_URL/deployment/pkgs/" "$REPO_ROOT/deployment/pkgs" \
-    --delete --exclude "*.DS_Store" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
+  log ">> force downloading pkgs"
+  aws_cmd s3 sync "$S3_URL/pkgs/" "$BASE/pkgs" \
+    --delete --exclude "*.DS_Store" 2>&1 | tee -a "$LOGFILE"
   
-  log ">> force downloading deployment/icons"
-  aws s3 sync "$S3_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" \
-    --delete --exclude "*.DS_Store" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
+  log ">> force downloading icons"
+  aws_cmd s3 sync "$S3_URL/icons/" "$BASE/icons" \
+    --delete --exclude "*.DS_Store" 2>&1 | tee -a "$LOGFILE"
   
-  log "Force download complete (exact mirror of S3)"
+  log "Force download complete"
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
   exit 0
 fi
@@ -351,24 +372,20 @@ fi
 if [[ "$changed_paths" == "sync" ]]; then
   log ">> sync mode - full folder sync"
   
+  SYNC_OPTS=(--delete --exclude "*.DS_Store")
   if [[ "$DRY_RUN" == "true" ]]; then
-    SYNC_OPTS="--dryrun"
+    SYNC_OPTS+=(--dryrun)
     log "DRY RUN MODE - No actual downloads will occur"
-  else
-    SYNC_OPTS=""
   fi
   
-  log '>> syncing deployment/catalogs'
-  aws s3 sync "$S3_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" \
-    --exclude "*.DS_Store" --region "$AWS_REGION" $SYNC_OPTS 2>&1 | tee -a "$LOGFILE"
+  log '>> syncing catalogs'
+  aws_cmd s3 sync "$S3_URL/catalogs/" "$BASE/catalogs" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
   
-  log '>> syncing deployment/pkgs'
-  aws s3 sync "$S3_URL/deployment/pkgs/" "$REPO_ROOT/deployment/pkgs" \
-    --exclude "*.DS_Store" --region "$AWS_REGION" $SYNC_OPTS 2>&1 | tee -a "$LOGFILE"
+  log '>> syncing pkgs'
+  aws_cmd s3 sync "$S3_URL/pkgs/" "$BASE/pkgs" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
   
-  log '>> syncing deployment/icons'
-  aws s3 sync "$S3_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" \
-    --exclude "*.DS_Store" --region "$AWS_REGION" $SYNC_OPTS 2>&1 | tee -a "$LOGFILE"
+  log '>> syncing icons'
+  aws_cmd s3 sync "$S3_URL/icons/" "$BASE/icons" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
   
   log 'Sync mode complete'
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
@@ -377,23 +394,22 @@ fi
 
 # ── default: targeted downloads based on changes ───────────
 
-# Download catalogs if changed
 if echo "$changed_paths" | grep -q "catalogs"; then
-  log '>> syncing deployment/catalogs'
-  aws s3 sync "$S3_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" \
-    --exclude "*.DS_Store" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
+  log '>> syncing catalogs'
+  SYNC_OPTS=(--exclude "*.DS_Store")
+  [[ "$DRY_RUN" == "true" ]] && SYNC_OPTS+=(--dryrun)
+  aws_cmd s3 sync "$S3_URL/catalogs/" "$BASE/catalogs" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
 fi
 
-# Download icons if changed
 if echo "$changed_paths" | grep -q "icons"; then
-  log '>> syncing deployment/icons'
-  aws s3 sync "$S3_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" \
-    --exclude "*.DS_Store" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
+  log '>> syncing icons'
+  SYNC_OPTS=(--exclude "*.DS_Store")
+  [[ "$DRY_RUN" == "true" ]] && SYNC_OPTS+=(--dryrun)
+  aws_cmd s3 sync "$S3_URL/icons/" "$BASE/icons" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
 fi
 
-# Download specific packages if pkgsinfo changed
 if echo "$changed_paths" | grep -q "pkgsinfo"; then
-  pkgsinfo_cache="$REPO_ROOT/.git/logs/.changed-pkgsinfo-$$"
+  pkgsinfo_cache="$BASE/.git/logs/.changed-pkgsinfo-$$"
   
   if [[ -f "$pkgsinfo_cache" ]]; then
     log '>> extracting package locations from changed pkgsinfo files'
@@ -407,17 +423,21 @@ if echo "$changed_paths" | grep -q "pkgsinfo"; then
       while IFS= read -r pkg_path; do
         [[ -z "$pkg_path" ]] && continue
         
-        source_url="$S3_URL/deployment/pkgs/$pkg_path"
-        dest_path="$REPO_ROOT/deployment/pkgs/$pkg_path"
+        source_path="$S3_URL/pkgs/$pkg_path"
+        dest_path="$BASE/pkgs/$pkg_path"
         dest_dir=$(dirname "$dest_path")
         
         mkdir -p "$dest_dir"
         
         log "  - $pkg_path"
         
-        aws s3 cp "$source_url" "$dest_path" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE" || {
-          log "    WARNING: Failed to download $pkg_path (may not exist remotely)"
-        }
+        if [[ "$DRY_RUN" == "true" ]]; then
+          log "    [DRY RUN] Would download: $source_path -> $dest_path"
+        else
+          aws_cmd s3 cp "$source_path" "$dest_path" 2>&1 | tee -a "$LOGFILE" || {
+            log "    WARNING: Failed to download $pkg_path (may not exist remotely)"
+          }
+        fi
       done <<< "$installer_locations"
     else
       log "No installer_item_location entries found in changed pkgsinfo files"
@@ -431,5 +451,5 @@ fi
 log "Checking for orphan packages..."
 cleanup_orphan_packages
 
-log 'Git post-merge hook complete'
+log 'Git post-rewrite hook complete'
 mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
